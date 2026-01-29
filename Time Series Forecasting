@@ -1,74 +1,75 @@
-# ===============================
-# 1. IMPORT LIBRARIES
-# ===============================
+# ============================================================
+# Advanced Time Series Forecasting with Attention Mechanisms
+# ============================================================
 
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from torch.utils.data import Dataset, DataLoader
+import math
+import random
 
+# ------------------------------
 # Reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
+# ------------------------------
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+random.seed(SEED)
 
-# ===============================
-# 2. GENERATE MULTIVARIATE TIME SERIES
-# ===============================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def generate_time_series(n_steps=2000):
-    time = np.arange(n_steps)
+# ============================================================
+# 1. Synthetic Multivariate Time Series Data Generation
+# ============================================================
 
-    trend = time * 0.005
-    seasonality = 0.5 * np.sin(2 * np.pi * time / 50)
-    noise = np.random.normal(0, 0.2, n_steps)
+def generate_time_series(n_steps=5000):
+    t = np.arange(n_steps)
 
-    f1 = trend + seasonality + noise
-    f2 = 0.3 * np.cos(2 * np.pi * time / 30) + noise
-    f3 = np.random.normal(0, 0.3, n_steps)
+    # Trend
+    trend = 0.0005 * t
 
-    target = f1 + 0.5 * f2
+    # Seasonality
+    seasonal_1 = 2 * np.sin(2 * np.pi * t / 50)
+    seasonal_2 = 1.5 * np.sin(2 * np.pi * t / 100)
 
-    data = np.vstack([f1, f2, f3, target]).T
-    return pd.DataFrame(data, columns=["f1", "f2", "f3", "target"])
+    # Heteroscedastic noise
+    noise_scale = 0.3 + 0.0003 * t
+    noise = np.random.normal(0, noise_scale)
 
-df = generate_time_series()
+    # Target variable
+    y = trend + seasonal_1 + seasonal_2 + noise
 
-# ===============================
-# 3. NORMALIZATION & SEQUENCE WINDOWING
-# ===============================
+    # Exogenous variables
+    x1 = np.cos(2 * np.pi * t / 30) + np.random.normal(0, 0.2, n_steps)
+    x2 = np.sin(2 * np.pi * t / 70) + np.random.normal(0, 0.2, n_steps)
 
-scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(df)
+    data = np.stack([y, x1, x2], axis=1)
+    return data
 
-SEQ_LEN = 30
 
-def create_sequences(data, seq_len):
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[i:i+seq_len, :-1])
-        y.append(data[i+seq_len, -1])
-    return np.array(X), np.array(y)
+data = generate_time_series()
 
-X, y = create_sequences(scaled_data, SEQ_LEN)
+# ============================================================
+# 2. Dataset Preparation
+# ============================================================
 
-split = int(0.8 * len(X))
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
-
-# ===============================
-# 4. PYTORCH DATASET
-# ===============================
+SEQ_LEN = 60
+HORIZON = 1
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+    def __init__(self, data):
+        self.X = []
+        self.y = []
+
+        for i in range(len(data) - SEQ_LEN - HORIZON):
+            self.X.append(data[i:i+SEQ_LEN])
+            self.y.append(data[i+SEQ_LEN:i+SEQ_LEN+HORIZON, 0])
+
+        self.X = torch.tensor(np.array(self.X), dtype=torch.float32)
+        self.y = torch.tensor(np.array(self.y), dtype=torch.float32)
 
     def __len__(self):
         return len(self.X)
@@ -76,41 +77,53 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-train_loader = DataLoader(
-    TimeSeriesDataset(X_train, y_train),
-    batch_size=64,
-    shuffle=True
-)
 
-test_loader = DataLoader(
-    TimeSeriesDataset(X_test, y_test),
-    batch_size=64
-)
+train_size = int(0.8 * len(data))
+train_data = TimeSeriesDataset(data[:train_size])
+test_data = TimeSeriesDataset(data[train_size - SEQ_LEN:])
 
-# ===============================
-# 5. BASELINE MODEL: LSTM
-# ===============================
+train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
+
+# ============================================================
+# 3. Baseline Model: LSTM
+# ============================================================
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, 64, batch_first=True)
-        self.fc = nn.Linear(64, 1)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, HORIZON)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :]).squeeze()
+        out = out[:, -1, :]
+        return self.fc(out)
 
-lstm_model = LSTMModel(input_dim=3)
 
-# ===============================
-# 6. TRANSFORMER MODEL WITH SELF-ATTENTION
-# ===============================
+# ============================================================
+# 4. Attention-Based Model: Transformer
+# ============================================================
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
 
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2):
         super().__init__()
         self.embedding = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -118,105 +131,95 @@ class TransformerModel(nn.Module):
             batch_first=True
         )
 
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
-
-        self.fc = nn.Linear(d_model, 1)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.fc = nn.Linear(d_model, HORIZON)
 
     def forward(self, x):
         x = self.embedding(x)
-        x = self.transformer(x)
-        return self.fc(x[:, -1, :]).squeeze()
+        x = self.pos_encoder(x)
+        attn_out = self.transformer(x)
+        return self.fc(attn_out[:, -1, :])
 
-transformer_model = TransformerModel(input_dim=3)
 
-# ===============================
-# 7. TRAINING FUNCTION
-# ===============================
+# ============================================================
+# 5. Training & Evaluation Utilities
+# ============================================================
 
-def train_model(model, loader, epochs=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_fn = nn.MSELoss()
+def train_model(model, loader, epochs=10):
+    model.train()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
 
     for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0
-
-        for Xb, yb in loader:
+        total_loss = 0
+        for X, y in loader:
+            X, y = X.to(DEVICE), y.to(DEVICE)
             optimizer.zero_grad()
-            preds = model(Xb)
-            loss = loss_fn(preds, yb)
+            preds = model(X)
+            loss = criterion(preds, y)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(loader):.4f}")
 
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss / len(loader):.4f}")
-
-# ===============================
-# 8. TRAIN BOTH MODELS
-# ===============================
-
-print("\nTraining LSTM Model")
-train_model(lstm_model, train_loader)
-
-print("\nTraining Transformer Model")
-train_model(transformer_model, train_loader)
-
-# ===============================
-# 9. EVALUATION FUNCTION
-# ===============================
 
 def evaluate_model(model, loader):
     model.eval()
-    preds, trues = [], []
+    preds, actuals = [], []
 
     with torch.no_grad():
-        for Xb, yb in loader:
-            preds.extend(model(Xb).numpy())
-            trues.extend(yb.numpy())
+        for X, y in loader:
+            X = X.to(DEVICE)
+            output = model(X).cpu().numpy()
+            preds.append(output)
+            actuals.append(y.numpy())
 
-    rmse = np.sqrt(mean_squared_error(trues, preds))
-    mae = mean_absolute_error(trues, preds)
-    return rmse, mae, preds, trues
+    preds = np.vstack(preds).flatten()
+    actuals = np.vstack(actuals).flatten()
 
-lstm_rmse, lstm_mae, _, _ = evaluate_model(lstm_model, test_loader)
-trans_rmse, trans_mae, trans_preds, trans_true = evaluate_model(transformer_model, test_loader)
+    rmse = math.sqrt(mean_squared_error(actuals, preds))
+    mae = mean_absolute_error(actuals, preds)
+    mape = np.mean(np.abs((actuals - preds) / actuals)) * 100
 
-print("\nMODEL COMPARISON")
-print(f"LSTM        -> RMSE: {lstm_rmse:.4f}, MAE: {lstm_mae:.4f}")
-print(f"Transformer -> RMSE: {trans_rmse:.4f}, MAE: {trans_mae:.4f}")
+    return rmse, mae, mape
 
-# ===============================
-# 10. PREDICTION VISUALIZATION
-# ===============================
 
-plt.figure(figsize=(10, 4))
-plt.plot(trans_true[:200], label="Actual")
-plt.plot(trans_preds[:200], label="Transformer Prediction")
-plt.title("Transformer Forecast vs Actual")
-plt.legend()
-plt.show()
+# ============================================================
+# 6. Model Training
+# ============================================================
 
-# ===============================
-# 11. ATTENTION WEIGHT VISUALIZATION
-# ===============================
+lstm_model = LSTMModel(input_dim=3, hidden_dim=64).to(DEVICE)
+transformer_model = TransformerModel(input_dim=3).to(DEVICE)
 
-def visualize_attention(model, sample):
-    model.eval()
-    with torch.no_grad():
-        embedded = model.embedding(sample.unsqueeze(0))
-        attn_weights = model.transformer.layers[0].self_attn(
-            embedded, embedded, embedded, need_weights=True
-        )[1]
+print("\nTraining Baseline LSTM")
+train_model(lstm_model, train_loader)
 
-    plt.imshow(attn_weights[0].mean(0), cmap="viridis")
-    plt.title("Self-Attention Weight Matrix")
-    plt.xlabel("Time Steps")
-    plt.ylabel("Time Steps")
-    plt.colorbar()
-    plt.show()
+print("\nTraining Attention-Based Transformer")
+train_model(transformer_model, train_loader)
 
-sample_input = torch.tensor(X_test[0], dtype=torch.float32)
-visualize_attention(transformer_model, sample_input)
+# ============================================================
+# 7. Evaluation & Comparison
+# ============================================================
+
+lstm_metrics = evaluate_model(lstm_model, test_loader)
+transformer_metrics = evaluate_model(transformer_model, test_loader)
+
+print("\nModel Performance Comparison")
+print("--------------------------------")
+print(f"LSTM       -> RMSE: {lstm_metrics[0]:.4f}, MAE: {lstm_metrics[1]:.4f}, MAPE: {lstm_metrics[2]:.2f}%")
+print(f"Transformer-> RMSE: {transformer_metrics[0]:.4f}, MAE: {transformer_metrics[1]:.4f}, MAPE: {transformer_metrics[2]:.2f}%")
+
+# ============================================================
+# 8. Attention Interpretability Discussion (Conceptual Output)
+# ============================================================
+
+print("""
+Interpretability Discussion:
+The Transformer model leverages self-attention to dynamically weight
+historical time steps when making predictions. Unlike LSTMs that compress
+information into a fixed hidden state, attention enables the model to focus
+on relevant seasonal cycles and trend components across long horizons.
+This allows practitioners to inspect attention scores to identify which
+time steps most strongly influenced a forecast, improving transparency
+and trust in production forecasting systems.
+""")
